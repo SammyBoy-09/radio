@@ -1,6 +1,7 @@
 import Pusher from "pusher-js";
 
 let pusherClient: Pusher | null = null;
+let authParams: Record<string, string> = {};
 
 export function getPusherClient(): Pusher {
   if (pusherClient) return pusherClient;
@@ -15,10 +16,21 @@ export function getPusherClient(): Pusher {
   pusherClient = new Pusher(key, {
     cluster,
     authEndpoint: "/api/pusher/auth",
+    auth: {
+      params: authParams,
+    },
     forceTLS: true,
   });
 
   return pusherClient;
+}
+
+export function setPusherAuthParams(params: Record<string, string>) {
+  authParams = params;
+
+  if (!pusherClient) return;
+  pusherClient.disconnect();
+  pusherClient = null;
 }
 
 export function closePusherClient() {

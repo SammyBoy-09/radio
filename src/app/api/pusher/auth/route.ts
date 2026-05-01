@@ -15,22 +15,26 @@ export async function POST(request: NextRequest) {
     let socketId = "";
     let channelName = "";
     let username: string | undefined;
+    let sessionId: string | undefined;
 
     if (contentType.includes("application/json")) {
       const body = (await request.json()) as {
         socket_id?: string;
         channel_name?: string;
         username?: string;
+        session_id?: string;
       };
       socketId = body.socket_id || "";
       channelName = body.channel_name || "";
       username = body.username;
+      sessionId = body.session_id;
     } else {
       const bodyText = await request.text();
       const params = new URLSearchParams(bodyText);
       socketId = params.get("socket_id") || "";
       channelName = params.get("channel_name") || "";
       username = params.get("username") || undefined;
+      sessionId = params.get("session_id") || undefined;
     }
 
     if (!socketId || !channelName) {
@@ -40,18 +44,17 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (!channelName.startsWith("private-") && !channelName.startsWith("presence-")) {
+    if (channelName !== "presence-radio") {
       return NextResponse.json({ error: "Invalid channel" }, { status: 403 });
     }
 
-    const auth = channelName.startsWith("presence-")
-      ? pusher.authorizeChannel(socketId, channelName, {
-          user_id: username || `user-${socketId.slice(0, 8)}`,
-          user_info: {
-            name: username || "Guest",
-          },
-        })
-      : pusher.authorizeChannel(socketId, channelName);
+    const auth = pusher.authorizeChannel(socketId, channelName, {
+      user_id: sessionId || `session-${socketId.slice(0, 8)}`,
+      user_info: {
+        name: username || "Guest",
+        sessionId: sessionId || `session-${socketId.slice(0, 8)}`,
+      },
+    });
 
     return NextResponse.json(auth, { status: 200 });
   } catch (error) {

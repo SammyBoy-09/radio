@@ -34,8 +34,9 @@ import { Badge } from "@/components/ui/badge";
 import { Slider } from "@/components/ui/slider";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
-import { getPusherClient } from "@/lib/pusher";
+import { getPusherClient, setPusherAuthParams } from "@/lib/pusher";
 import { YouTubePlayer } from "@/components/YouTubePlayer";
+import Image from "next/image";
 
 type Song = {
   id: string;
@@ -55,10 +56,49 @@ type ChatMsg = {
 };
 
 const mockQueue: Song[] = [];
+const RADIO_CHANNEL = "presence-radio";
 
-const mockResultsBank: Song[] = [];
+type RoomChannel = {
+  bind: (event: string, callback: (payload: unknown) => void) => void;
+  trigger: (event: string, payload: Record<string, unknown>) => void;
+};
 
-const mockListeners: string[] = [];
+type PresenceMember = {
+  id: string;
+  info?: {
+    name?: string;
+  };
+};
+
+type PresenceMembers = {
+  each: (callback: (member: PresenceMember) => void) => void;
+};
+
+type PlayerActionPayload = {
+  action: "play" | "pause" | "seek" | "next" | "prev";
+  user?: string;
+  sessionId?: string;
+  progress?: number;
+  queue?: Song[];
+  activeId?: string;
+  text?: string;
+  time?: number;
+};
+
+function getOrCreateSessionId() {
+  if (typeof window === "undefined") return "";
+
+  const existing = window.localStorage.getItem("obsidian-radio-session-id");
+  if (existing) return existing;
+
+  const next =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `session-${Math.random().toString(36).slice(2, 10)}`;
+
+  window.localStorage.setItem("obsidian-radio-session-id", next);
+  return next;
+}
 
 function avatarColor(name: string) {
   const palette = ["#f5f5f5", "#a1a1aa", "#71717a", "#fafafa", "#d4d4d8"];
@@ -76,15 +116,14 @@ function fmt(sec: number) {
 
 export default function Home() {
   const [joined, setJoined] = useState(false);
-  const [code, setCode] = useState("");
   const [username, setUsername] = useState("");
   const [isHost, setIsHost] = useState(false);
+  const [sessionId] = useState(() => (typeof window === "undefined" ? "" : getOrCreateSessionId()));
 
   const [playing, setPlaying] = useState(true);
   const [queue, setQueue] = useState<Song[]>(mockQueue);
   const [activeId, setActiveId] = useState<string>("");
   const [progress, setProgress] = useState(0);
-  const [seeking, setSeeking] = useState(false);
   const [volume, setVolume] = useState(70);
   const [muted, setMuted] = useState(false);
   const [repeatMode, setRepeatMode] = useState<"off" | "all" | "one">("off");
@@ -96,7 +135,8 @@ export default function Home() {
   const [results, setResults] = useState<Song[]>([]);
 
   const [skipVotes, setSkipVotes] = useState<Set<string>>(new Set());
-  const totalListeners = mockListeners.length;
+  const [listeners, setListeners] = useState<Array<{ id: string; name: string }>>([]);
+  const totalListeners = Math.max(1, listeners.length);
   const votesNeeded = Math.max(1, Math.ceil(totalListeners / 2));
 
   const [dragId, setDragId] = useState<string | null>(null);
@@ -104,7 +144,8 @@ export default function Home() {
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [chatInput, setChatInput] = useState("");
   const chatScrollRef = useRef<HTMLDivElement>(null);
-  const channelRef = useRef<any>(null);
+  const channelRef = useRef<RoomChannel | null>(null);
+  const [seekCommand, setSeekCommand] = useState<{ time: number; nonce: number } | null>(null);
 
   const [mobileTab, setMobileTab] = useState<"queue" | "search" | "chat">("queue");
 
@@ -115,24 +156,62 @@ export default function Home() {
     return queue[(idx + 1) % queue.length] ?? null;
   }, [queue, activeId, activeSong]);
 
-  useEffect(() => {
+  const switchTrack = useCallback((nextId: string) => {
+    setActiveId(nextId);
     setSkipVotes(new Set());
     setProgress(0);
-  }, [activeId]);
+  }, []);
+
+  const emitSeekCommit = useCallback(
+    (time: number) => {
+      setSeekCommand({ time, nonce: Date.now() });
+      channelRef.current?.trigger("client-player-action", {
+        action: "seek",
+        progress: time,
+        user: username || "guest",
+        sessionId,
+      });
+    },
+    [sessionId, username],
+  );
 
   useEffect(() => {
-    if (!playing || !activeSong || seeking) return;
+    if (!playing || !activeSong) return;
     const t = setInterval(() => {
       setProgress((p) => {
         if (p + 1 >= activeSong.duration) {
-          handleTrackEnd();
+          if (repeatMode === "one") {
+            setProgress(0);
+            return 0;
+          }
+          if (!autoplay) {
+            setPlaying(false);
+            return 0;
+          }
+
+          const nextId = (() => {
+            if (!queue.length) return "";
+            if (shuffle) {
+              const others = queue.filter((s) => s.id !== activeId);
+              if (!others.length) return activeId;
+              return others[Math.floor(Math.random() * others.length)].id;
+            }
+            const idx = queue.findIndex((s) => s.id === activeId);
+            if (idx === -1) return queue[0].id;
+            if (idx + 1 >= queue.length) {
+              return repeatMode === "all" ? queue[0].id : queue[queue.length - 1].id;
+            }
+            return queue[idx + 1].id;
+          })();
+
+          if (nextId) switchTrack(nextId);
           return 0;
         }
         return p + 1;
       });
     }, 1000);
     return () => clearInterval(t);
-  }, [playing, activeSong, seeking, repeatMode, shuffle, autoplay, queue]);
+  }, [playing, activeSong, autoplay, repeatMode, queue, shuffle, activeId, setPlaying, setProgress, switchTrack]);
 
   useEffect(() => {
     const el = chatScrollRef.current;
@@ -141,74 +220,108 @@ export default function Home() {
 
   // Pusher integration
   useEffect(() => {
-    if (!joined || !code || !username) return;
+    if (!joined || !username || !sessionId) return;
+
+    setPusherAuthParams({ username, session_id: sessionId });
 
     const pusher = getPusherClient();
-    const channelName = `private-room-${code}`;
-    const channel = pusher.subscribe(channelName);
+    const channelName = RADIO_CHANNEL;
+    const channel = pusher.subscribe(channelName) as unknown as RoomChannel;
     channelRef.current = channel;
 
+    channel.bind("pusher:subscription_succeeded", (payload: unknown) => {
+      const members = payload as PresenceMembers;
+      const nextListeners: Array<{ id: string; name: string }> = [];
+      members.each((member) => {
+        nextListeners.push({
+          id: member.id,
+          name: member.info?.name || "Guest",
+        });
+      });
+      setListeners(nextListeners);
+    });
+
+    channel.bind("pusher:member_added", (payload: unknown) => {
+      const member = payload as PresenceMember;
+      setListeners((current) => {
+        if (current.some((entry) => entry.id === member.id)) return current;
+        return [...current, { id: member.id, name: member.info?.name || "Guest" }];
+      });
+    });
+
+    channel.bind("pusher:member_removed", (payload: unknown) => {
+      const member = payload as PresenceMember;
+      setListeners((current) => current.filter((entry) => entry.id !== member.id));
+    });
+
     // Listen for player actions from other users
-    channel.bind("player-action", (data: any) => {
-      if (data.user === username) return; // Ignore own events
+    channel.bind("player-action", (payload: unknown) => {
+      const data = payload as PlayerActionPayload;
+      if (data.sessionId === sessionId) return; // Ignore own events
       if (data.action === "play") setPlaying(true);
       if (data.action === "pause") setPlaying(false);
-      if (data.action === "seek") setProgress(data.progress);
+      if (data.action === "seek") {
+        const nextTime = data.progress || 0;
+        setProgress(nextTime);
+        setSeekCommand({ time: nextTime, nonce: Date.now() });
+      }
       if (data.action === "next") {
-        setActiveId((current) => {
-          const q = queue;
+        const nextId = (() => {
+          if (!queue.length) return "";
           if (shuffle) {
-            const others = q.filter((s) => s.id !== current);
-            if (!others.length) return current;
+            const others = queue.filter((song) => song.id !== activeId);
+            if (!others.length) return activeId;
             return others[Math.floor(Math.random() * others.length)].id;
           }
-          const idx = q.findIndex((s) => s.id === current);
-          if (idx === -1) return q[0]?.id || "";
-          if (idx + 1 >= q.length) {
-            return repeatMode === "all" ? q[0]?.id || "" : q[q.length - 1]?.id || "";
+          const idx = queue.findIndex((song) => song.id === activeId);
+          if (idx === -1) return queue[0].id;
+          if (idx + 1 >= queue.length) {
+            return repeatMode === "all" ? queue[0].id : queue[queue.length - 1].id;
           }
-          return q[idx + 1]?.id || "";
-        });
+          return queue[idx + 1].id;
+        })();
+        if (nextId) switchTrack(nextId);
       }
       if (data.action === "prev") {
         if (progress > 3) {
           setProgress(0);
         } else {
-          setActiveId((current) => {
-            const q = queue;
-            if (!q.length) return current;
-            const idx = q.findIndex((s) => s.id === current);
-            const prev = q[(idx - 1 + q.length) % q.length];
-            return prev.id;
-          });
+          const idx = queue.findIndex((s) => s.id === activeId);
+          const prev = queue[(idx - 1 + queue.length) % queue.length];
+          if (prev) switchTrack(prev.id);
         }
       }
     });
 
     // Listen for queue updates
-    channel.bind("queue-updated", (data: any) => {
-      if (data.user === username) return;
-      setQueue(data.queue);
-      if (data.activeId) setActiveId(data.activeId);
+    channel.bind("queue-updated", (payload: unknown) => {
+      const data = payload as PlayerActionPayload;
+      if (data.sessionId === sessionId) return;
+      setQueue(data.queue || []);
+      if (data.activeId) switchTrack(data.activeId);
     });
 
     // Listen for chat messages
-    channel.bind("chat-message", (data: any) => {
+    channel.bind("chat-message", (payload: unknown) => {
+      const data = payload as { user?: string; text?: string };
       setMessages((m) => [
         ...m,
         {
           id: `m${Date.now()}-${Math.random()}`,
-          user: data.user,
-          text: data.text,
+          user: data.user || "guest",
+          text: data.text || "",
           ts: Date.now(),
         },
       ]);
     });
 
     // Listen for time sync from host
-    channel.bind("sync-time", (data: any) => {
-      if (!isHost && Math.abs(data.time - progress) > 2) {
-        setProgress(data.time);
+    channel.bind("sync-time", (payload: unknown) => {
+      const data = payload as { time?: number };
+      const nextTime = data.time || 0;
+      if (!isHost && Math.abs(nextTime - progress) > 2) {
+        setProgress(nextTime);
+        setSeekCommand({ time: nextTime, nonce: Date.now() });
       }
     });
 
@@ -216,7 +329,7 @@ export default function Home() {
       pusher.unsubscribe(channelName);
       channelRef.current = null;
     };
-  }, [joined, code, username, isHost, progress, queue, repeatMode, shuffle]);
+  }, [joined, username, sessionId, isHost, progress, queue, activeId, repeatMode, shuffle, switchTrack]);
 
   // Host time polling - emit current time every 5 seconds
   useEffect(() => {
@@ -226,23 +339,12 @@ export default function Home() {
       channelRef.current?.trigger("client-sync-time", {
         time: progress,
         user: username,
+        sessionId,
       });
     }, 5000);
 
     return () => clearInterval(interval);
-  }, [joined, isHost, progress, username]);
-
-  function handleTrackEnd() {
-    if (repeatMode === "one") {
-      setProgress(0);
-      return;
-    }
-    if (!autoplay) {
-      setPlaying(false);
-      return;
-    }
-    skipNext();
-  }
+  }, [joined, isHost, progress, username, sessionId]);
 
   const addToQueue = (song: Song) => {
     setQueue((q) => {
@@ -251,7 +353,7 @@ export default function Home() {
         return q;
       }
       const next = [...q, { ...song, addedBy: username || "guest" }];
-      if (!q.length) setActiveId(song.id);
+      if (!q.length) switchTrack(song.id);
       return next;
     });
     toast.success("Added to queue", { description: `${song.title} - ${song.artist}` });
@@ -264,7 +366,7 @@ export default function Home() {
       const next = q.filter((s) => s.id !== id);
       if (id === activeId) {
         const fallback = next[idx] ?? next[idx - 1] ?? next[0];
-        setActiveId(fallback ? fallback.id : "");
+        switchTrack(fallback ? fallback.id : "");
       }
       return next;
     });
@@ -288,12 +390,13 @@ export default function Home() {
   const skipNext = () => {
     const nid = pickNextId();
     if (nid) {
-      setActiveId(nid);
+      switchTrack(nid);
       // Emit to Pusher
       if (channelRef.current) {
         channelRef.current?.trigger("client-player-action", {
           action: "next",
           user: username,
+          sessionId,
         });
       }
     }
@@ -307,6 +410,7 @@ export default function Home() {
           action: "seek",
           progress: 0,
           user: username,
+          sessionId,
         });
       }
       return;
@@ -314,11 +418,12 @@ export default function Home() {
     if (!queue.length) return;
     const idx = queue.findIndex((s) => s.id === activeId);
     const prev = queue[(idx - 1 + queue.length) % queue.length];
-    setActiveId(prev.id);
+    switchTrack(prev.id);
     if (channelRef.current) {
       channelRef.current?.trigger("client-player-action", {
         action: "prev",
         user: username,
+        sessionId,
       });
     }
   };
@@ -367,34 +472,37 @@ export default function Home() {
   const onDragEnd = () => setDragId(null);
 
   // Debounced search with API call
-  const debouncedSearch = useCallback(
-    debounce(async (q: string) => {
-      if (!q.trim()) {
-        setResults([]);
-        setSearching(false);
-        return;
-      }
+  const debouncedSearch = useMemo(
+    () =>
+      debounce(async (q: string) => {
+        if (!q.trim()) {
+          setResults([]);
+          setSearching(false);
+          return;
+        }
 
-      try {
-        setSearching(true);
-        const response = await fetch("/api/search", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query: q }),
-        });
+        try {
+          setSearching(true);
+          const response = await fetch("/api/search", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: q }),
+          });
 
-        if (!response.ok) throw new Error("Search failed");
-        const data = await response.json();
-        setResults(data.results || []);
-      } catch (error) {
-        console.error("Search error:", error);
-        setResults([]);
-      } finally {
-        setSearching(false);
-      }
-    }, 300),
+          if (!response.ok) throw new Error("Search failed");
+          const data = await response.json();
+          setResults(data.results || []);
+        } catch (error) {
+          console.error("Search error:", error);
+          setResults([]);
+        } finally {
+          setSearching(false);
+        }
+      }, 300),
     [],
   );
+
+  useEffect(() => () => debouncedSearch.cancel(), [debouncedSearch]);
 
   useEffect(() => {
     debouncedSearch(query);
@@ -412,6 +520,7 @@ export default function Home() {
       channelRef.current?.trigger("client-chat-message", {
         user: username || "guest",
         text,
+        sessionId,
       });
     }
     
@@ -421,34 +530,19 @@ export default function Home() {
   if (!joined) {
     return (
       <JoinScreen
-        code={code}
-        setCode={setCode}
         username={username}
         setUsername={setUsername}
         onJoin={() => {
           setIsHost(true); // User is the host when creating a room
           setJoined(true);
           setTimeout(
-            () => toast.success(`Welcome, ${username || "guest"}`, { description: `Created room ${code}` }),
+            () => toast.success(`Welcome, ${username || "guest"}`, { description: "You joined the live room" }),
             100,
           );
         }}
       />
     );
   }
-
-  const queuePanel = (
-    <QueueList
-      queue={queue}
-      activeId={activeId}
-      dragId={dragId}
-      onSelect={setActiveId}
-      onRemove={removeFromQueue}
-      onDragStart={onDragStart}
-      onDragOver={onDragOver}
-      onDragEnd={onDragEnd}
-    />
-  );
 
   const searchPanel = (
     <SearchPanel
@@ -473,6 +567,19 @@ export default function Home() {
     />
   );
 
+  const queuePanel = (
+    <QueueList
+      queue={queue}
+      activeId={activeId}
+      dragId={dragId}
+      onSelect={setActiveId}
+      onRemove={removeFromQueue}
+      onDragStart={onDragStart}
+      onDragOver={onDragOver}
+      onDragEnd={onDragEnd}
+    />
+  );
+
   return (
     <div className="min-h-dvh w-full flex flex-col bg-black text-white overflow-x-auto overflow-y-auto">
       <header className="h-14 sm:h-16 shrink-0 border-b border-zinc-900 flex items-center justify-between px-3 sm:px-6 gap-2">
@@ -483,7 +590,7 @@ export default function Home() {
           <span className="text-sm font-semibold tracking-tight truncate">Obsidian Radio</span>
         </div>
         <div className="hidden sm:block text-xs text-zinc-400 font-mono tracking-widest">
-          ROOM - <span className="text-white">{code}</span>
+          LIVE ROOM
         </div>
         <div className="flex items-center gap-2 sm:gap-3">
           <Badge variant="outline" className="border-zinc-800 bg-zinc-900/60 text-zinc-300 gap-1.5 font-normal">
@@ -510,8 +617,8 @@ export default function Home() {
             setPlaying={setPlaying}
             progress={progress}
             setProgress={setProgress}
-            seeking={seeking}
-            setSeeking={setSeeking}
+            seekCommand={seekCommand}
+            onSeekCommit={emitSeekCommit}
             volume={volume}
             setVolume={setVolume}
             muted={muted}
@@ -599,8 +706,8 @@ function Player({
   setPlaying,
   progress,
   setProgress,
-  seeking,
-  setSeeking,
+  seekCommand,
+  onSeekCommit,
   volume,
   setVolume,
   muted,
@@ -623,8 +730,8 @@ function Player({
   setPlaying: (v: boolean) => void;
   progress: number;
   setProgress: (v: number) => void;
-  seeking: boolean;
-  setSeeking: (v: boolean) => void;
+  seekCommand: { time: number; nonce: number } | null;
+  onSeekCommit: (time: number) => void;
   volume: number;
   setVolume: (v: number) => void;
   muted: boolean;
@@ -644,118 +751,109 @@ function Player({
 }) {
   const duration = activeSong?.duration ?? 0;
   const RepeatIcon = repeatMode === "one" ? Repeat1 : Repeat;
-  const [seekCommand, setSeekCommand] = useState<{ time: number; nonce: number } | null>(null);
   const handlePlayerPlay = useCallback(() => setPlaying(true), [setPlaying]);
   const handlePlayerPause = useCallback(() => setPlaying(false), [setPlaying]);
-  const handlePlayerStateChange = useCallback((time: number) => {
-    setProgress(Math.floor(time));
-  }, [setProgress]);
+  const handlePlayerStateChange = useCallback(
+    (time: number) => {
+      setProgress(Math.floor(time));
+    },
+    [setProgress],
+  );
   const handlePlayerEnded = useCallback(() => {
-    // The host-side timer advances tracks; keep the player callback stable.
-  }, []);
+    skipNext();
+  }, [skipNext]);
+
+  const handleSeekChange = (value: number[]) => {
+    const nextTime = value[0] ?? 0;
+    setProgress(nextTime);
+  };
+
+  const handleSeekCommit = (value: number[]) => {
+    const nextTime = value[0] ?? 0;
+    onSeekCommit(nextTime);
+  };
 
   return (
-    <>
-      <div className="aspect-video w-full rounded-xl border border-zinc-800 bg-zinc-950 relative overflow-hidden">
-        {activeSong ? (
-          <YouTubePlayer
-            videoId={activeSong.id}
-            playing={playing}
-            onPlay={handlePlayerPlay}
-            onPause={handlePlayerPause}
-            onStateChange={handlePlayerStateChange}
-            onEnded={handlePlayerEnded}
-            seekCommand={seekCommand}
-          />
-        ) : (
-          <div className="absolute inset-0 flex items-center justify-center bg-zinc-950">
-            <EmptyIllustration
-              icon={<Music2 className="h-8 w-8" />}
-              title="Nothing is playing"
-              hint="Search for a track to start the room"
-            />
-          </div>
-        )}
-
-        {upNext && activeSong && upNext.id !== activeSong.id && (
-          <div className="absolute bottom-3 right-3 max-w-[60%] rounded-lg border border-zinc-800 bg-black/70 backdrop-blur px-3 py-2 flex items-center gap-2.5">
-            <div className="text-[9px] uppercase tracking-[0.25em] text-zinc-500 shrink-0">Up Next</div>
-            <div className="min-w-0">
-              <div className="text-xs text-white truncate">{upNext.title}</div>
-              <div className="text-[10px] text-zinc-500 truncate">{upNext.artist}</div>
-            </div>
-          </div>
-        )}
-      </div>
-
-      <div className="rounded-xl border border-zinc-900 bg-zinc-950/50 p-4 sm:p-5 backdrop-blur-sm">
+    <div className="rounded-2xl border border-zinc-900 bg-zinc-950/95 shadow-[0_12px_48px_rgba(0,0,0,0.35)] overflow-hidden">
+      <div className="p-3 sm:p-4 border-b border-zinc-900 space-y-3">
         <div className="flex items-center gap-3">
-          <span className="text-[11px] font-mono text-zinc-500 tabular-nums w-10 text-right">{fmt(progress)}</span>
+          <div className="h-14 w-14 sm:h-16 sm:w-16 rounded-xl overflow-hidden border border-zinc-800 bg-black shrink-0 flex items-center justify-center">
+            {activeSong?.thumbnail ? (
+              <Image src={activeSong.thumbnail} alt="" fill sizes="64px" className="object-cover" />
+            ) : (
+              <Music2 className="h-6 w-6 text-zinc-700" />
+            )}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-[10px] uppercase tracking-[0.25em] text-zinc-500 mb-1">Now Playing</div>
+            <div className="text-base sm:text-lg font-medium truncate">{activeSong?.title ?? "Nothing queued"}</div>
+            <div className="text-sm text-zinc-400 truncate">{activeSong?.artist ?? "Add a song to start the room"}</div>
+          </div>
+          <button
+            onClick={cycleRepeat}
+            className="h-9 w-9 rounded-full border border-zinc-800 text-zinc-300 hover:text-white hover:bg-white/5 flex items-center justify-center"
+            title={`Repeat: ${repeatMode}`}
+          >
+            <RepeatIcon className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.25em] text-zinc-500 font-mono">
+            <span>{fmt(progress)}</span>
+            <span>{fmt(duration)}</span>
+          </div>
           <Slider
             value={[Math.min(progress, duration)]}
             max={Math.max(duration, 1)}
             step={1}
+            onValueChange={handleSeekChange}
+            onValueCommit={handleSeekCommit}
             disabled={!activeSong}
-            onValueChange={(v) => {
-              setSeeking(true);
-              setProgress(v[0]);
-            }}
-            onValueCommit={(v) => {
-              setProgress(v[0]);
-              setSeeking(false);
-              setSeekCommand({ time: v[0], nonce: Date.now() });
-            }}
-            className="flex-1"
           />
-          <span className="text-[11px] font-mono text-zinc-500 tabular-nums w-10">{fmt(duration)}</span>
         </div>
 
-        <div className="mt-4 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-1">
-            <IconToggle active={shuffle} onClick={() => setShuffle(!shuffle)} title="Shuffle">
-              <Shuffle className="h-4 w-4" />
-            </IconToggle>
-            <IconToggle active={repeatMode !== "off"} onClick={cycleRepeat} title={`Repeat: ${repeatMode}`}>
-              <RepeatIcon className="h-4 w-4" />
-            </IconToggle>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <Button onClick={skipPrev} size="icon" variant="ghost" className="h-10 w-10 rounded-full hover:bg-white/5 text-zinc-400 hover:text-white">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-1.5 sm:gap-2">
+            <Button variant="ghost" size="icon" onClick={skipPrev} className="h-9 w-9 rounded-full">
               <SkipForward className="h-4 w-4 rotate-180" />
             </Button>
             <Button
+              variant="secondary"
               size="icon"
               onClick={() => setPlaying(!playing)}
-              disabled={!activeSong}
-              className="h-12 w-12 rounded-full bg-white text-black hover:bg-zinc-200 shadow-[0_0_30px_rgba(255,255,255,0.2)] disabled:opacity-30 disabled:shadow-none"
+              className="h-11 w-11 rounded-full bg-white text-black hover:bg-zinc-200"
             >
-              {playing ? <Pause className="h-5 w-5" fill="currentColor" /> : <Play className="h-5 w-5 ml-0.5" fill="currentColor" />}
+              {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 ml-0.5" />}
             </Button>
-            <Button onClick={skipNext} size="icon" variant="ghost" className="h-10 w-10 rounded-full hover:bg-white/5 text-zinc-400 hover:text-white">
+            <Button variant="ghost" size="icon" onClick={skipNext} className="h-9 w-9 rounded-full">
               <SkipForward className="h-4 w-4" />
             </Button>
           </div>
 
-          <div className="flex items-center gap-1">
-            <IconToggle active={autoplay} onClick={() => setAutoplay(!autoplay)} title="Autoplay next">
+          <div className="flex items-center gap-1.5 sm:gap-2">
+            <IconToggle active={shuffle} onClick={() => setShuffle(!shuffle)} title="Shuffle">
+              <Shuffle className="h-4 w-4" />
+            </IconToggle>
+            <IconToggle active={autoplay} onClick={() => setAutoplay(!autoplay)} title="Autoplay">
               <Sparkles className="h-4 w-4" />
             </IconToggle>
             <Button
-              onClick={voteSkip}
               variant="ghost"
-              size="sm"
-              disabled={!activeSong}
-              className="h-9 px-2.5 text-zinc-400 hover:text-white hover:bg-white/5 rounded-md gap-1.5"
+              size="icon"
+              onClick={voteSkip}
+              className="h-9 w-9 rounded-full text-zinc-300 hover:text-white hover:bg-white/5 relative"
               title="Vote to skip"
             >
               <Forward className="h-4 w-4" />
-              <span className="text-[11px] font-mono tabular-nums hidden sm:inline">{skipVotes.size}/{votesNeeded}</span>
+              <span className="absolute -bottom-1 -right-1 text-[9px] font-mono bg-black border border-zinc-800 rounded-full px-1 text-zinc-400">
+                {skipVotes.size}/{votesNeeded}
+              </span>
             </Button>
           </div>
         </div>
 
-        <div className="mt-4 pt-4 border-t border-zinc-900 flex items-center gap-3">
+        <div className="flex items-center gap-3 pt-2 border-t border-zinc-900">
           <button
             onClick={() => setMuted(!muted)}
             className="text-zinc-400 hover:text-white transition"
@@ -771,35 +869,136 @@ function Player({
               setVolume(v[0]);
               if (v[0] > 0 && muted) setMuted(false);
             }}
-            className="max-w-[180px]"
+            className="max-w-45"
           />
           <span className="text-[10px] font-mono text-zinc-600 tabular-nums w-7">{muted ? 0 : volume}</span>
-
-          <div className="flex-1" />
-
-          <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-widest text-zinc-500">
-            <span className="h-1 w-1 rounded-full bg-white animate-pulse" />
-            Synced
-          </div>
-        </div>
-
-        <div className="mt-4 pt-4 border-t border-zinc-900">
-          <div className="text-[10px] uppercase tracking-[0.25em] text-zinc-500 mb-1.5">Now Playing</div>
-          <div className="flex items-baseline justify-between gap-4">
-            <div className="min-w-0">
-              <div className="text-base font-medium truncate">{activeSong?.title ?? ""}</div>
-              <div className="text-sm text-zinc-400 truncate">{activeSong ? activeSong.artist : ""}</div>
-            </div>
-            {activeSong?.addedBy && (
-              <div className="text-[10px] text-zinc-500 shrink-0 flex items-center gap-1.5">
-                <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: avatarColor(activeSong.addedBy) }} />
-                {activeSong.addedBy}
-              </div>
-            )}
-          </div>
         </div>
       </div>
-    </>
+
+      <div className="p-3 sm:p-4">
+        <div className="text-[10px] uppercase tracking-[0.25em] text-zinc-500 mb-2">Next Up</div>
+        {upNext ? (
+          <div className="flex items-center gap-3 rounded-xl border border-zinc-900 bg-black/30 p-2.5">
+            <div className="h-10 w-10 rounded-lg bg-zinc-900 border border-zinc-800 shrink-0 overflow-hidden relative">
+              {upNext.thumbnail ? <Image src={upNext.thumbnail} alt="" fill sizes="40px" className="object-cover" /> : <Music2 className="h-4 w-4 text-zinc-700" />}
+            </div>
+            <div className="min-w-0">
+              <div className="text-sm truncate">{upNext.title}</div>
+              <div className="text-xs text-zinc-500 truncate">{upNext.artist}</div>
+            </div>
+          </div>
+        ) : (
+          <div className="text-sm text-zinc-500">Queue a track to keep the room moving.</div>
+        )}
+      </div>
+
+      <YouTubePlayer
+        videoId={activeSong?.id ?? null}
+        playing={playing}
+        seekCommand={seekCommand}
+        onPlay={handlePlayerPlay}
+        onPause={handlePlayerPause}
+        onStateChange={handlePlayerStateChange}
+        onEnded={handlePlayerEnded}
+      />
+    </div>
+  );
+}
+
+function SongRow({
+  song,
+  active,
+  action,
+  onClick,
+  onAction,
+  draggable,
+  dimmed,
+  onDragStart,
+  onDragOver,
+  onDragEnd,
+}: {
+  song: Song;
+  active: boolean;
+  action: "add" | "remove";
+  onClick?: () => void;
+  onAction?: () => void;
+  draggable?: boolean;
+  dimmed?: boolean;
+  onDragStart?: () => void;
+  onDragOver?: (e: React.DragEvent) => void;
+  onDragEnd?: () => void;
+}) {
+  return (
+    <div
+      onClick={onClick}
+      draggable={draggable}
+      onDragStart={onDragStart}
+      onDragOver={onDragOver}
+      onDragEnd={onDragEnd}
+      className={`group relative flex items-center gap-2 sm:gap-3 p-2 pr-12 sm:pr-14 w-full min-w-0 overflow-hidden rounded-lg cursor-pointer transition-all border ${
+        active
+          ? "bg-white/4 border-zinc-800 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.03)]"
+          : "border-transparent hover:bg-white/2 hover:border-zinc-900"
+      } ${dimmed ? "opacity-40" : ""}`}
+    >
+      {draggable && (
+        <div className="text-zinc-700 group-hover:text-zinc-500 cursor-grab active:cursor-grabbing shrink-0">
+          <GripVertical className="h-4 w-4" />
+        </div>
+      )}
+      <div className="relative h-11 w-11 shrink-0 rounded-md bg-zinc-900 border border-zinc-800 flex items-center justify-center overflow-hidden">
+        {song.thumbnail ? (
+          <Image
+            src={song.thumbnail}
+            alt=""
+            referrerPolicy="no-referrer"
+            fill
+            sizes="44px"
+            className="object-cover"
+          />
+        ) : (
+          <Music2 className="h-4 w-4 text-zinc-600" />
+        )}
+        {active && (
+          <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+            <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse shadow-[0_0_8px_rgba(255,255,255,0.8)]" />
+          </div>
+        )}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className={`text-sm truncate ${active ? "text-white font-medium" : "text-zinc-200"}`}>
+          {song.title}
+        </div>
+        <div className="text-xs text-zinc-500 truncate flex items-center gap-1.5">
+          <span className="truncate">{song.artist}</span>
+          <span className="text-zinc-700 hidden sm:inline">.</span>
+          <span className="text-zinc-600 font-mono tabular-nums hidden sm:inline">{fmt(song.duration)}</span>
+          {song.addedBy && (
+            <>
+              <span className="text-zinc-700 hidden md:inline">.</span>
+              <span
+                className="hidden md:inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-white/4 border border-zinc-800 text-[10px] text-zinc-400 shrink-0"
+                title={`Added by ${song.addedBy}`}
+              >
+                <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: avatarColor(song.addedBy) }} />
+                <span>{song.addedBy}</span>
+              </span>
+            </>
+          )}
+        </div>
+      </div>
+      <Button
+        size="icon"
+        variant="ghost"
+        onClick={(e) => {
+          e.stopPropagation();
+          onAction?.();
+        }}
+        className="absolute right-2 top-1/2 -translate-y-1/2 h-7 w-7 flex-none shrink-0 opacity-100 transition-opacity text-zinc-400 hover:text-white hover:bg-white/10 rounded-full"
+      >
+        {action === "add" ? <Plus className="h-3.5 w-3.5" /> : <X className="h-3.5 w-3.5" />}
+      </Button>
+    </div>
   );
 }
 
@@ -990,7 +1189,7 @@ function ChatPanel({
                 <div className={`max-w-[75%] ${mine ? "items-end" : "items-start"} flex flex-col`}>
                   <div className="text-[10px] text-zinc-500 mb-0.5 px-1">{m.user}</div>
                   <div
-                    className={`px-3 py-2 rounded-2xl text-sm break-words ${
+                    className={`px-3 py-2 rounded-2xl text-sm wrap-break-word ${
                       mine ? "bg-white text-black rounded-tr-sm" : "bg-zinc-900 border border-zinc-800 text-zinc-100 rounded-tl-sm"
                     }`}
                   >
@@ -1024,102 +1223,6 @@ function ChatPanel({
           <SendHorizontal className="h-4 w-4" />
         </Button>
       </form>
-    </div>
-  );
-}
-
-function SongRow({
-  song,
-  active,
-  action,
-  onClick,
-  onAction,
-  draggable,
-  dimmed,
-  onDragStart,
-  onDragOver,
-  onDragEnd,
-}: {
-  song: Song;
-  active: boolean;
-  action: "add" | "remove";
-  onClick?: () => void;
-  onAction?: () => void;
-  draggable?: boolean;
-  dimmed?: boolean;
-  onDragStart?: () => void;
-  onDragOver?: (e: React.DragEvent) => void;
-  onDragEnd?: () => void;
-}) {
-  return (
-    <div
-      onClick={onClick}
-      draggable={draggable}
-      onDragStart={onDragStart}
-      onDragOver={onDragOver}
-      onDragEnd={onDragEnd}
-        className={`group relative flex items-center gap-2 sm:gap-3 p-2 pr-12 sm:pr-14 w-full min-w-0 overflow-hidden rounded-lg cursor-pointer transition-all border ${
-        active
-          ? "bg-white/[0.04] border-zinc-800 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.03)]"
-          : "border-transparent hover:bg-white/[0.02] hover:border-zinc-900"
-      } ${dimmed ? "opacity-40" : ""}`}
-    >
-      {draggable && (
-        <div className="text-zinc-700 group-hover:text-zinc-500 cursor-grab active:cursor-grabbing shrink-0">
-          <GripVertical className="h-4 w-4" />
-        </div>
-      )}
-      <div className="relative h-11 w-11 shrink-0 rounded-md bg-zinc-900 border border-zinc-800 flex items-center justify-center overflow-hidden">
-        {song.thumbnail ? (
-          <img
-            src={song.thumbnail}
-            alt=""
-            className="h-full w-full object-cover"
-            loading="lazy"
-            referrerPolicy="no-referrer"
-          />
-        ) : (
-          <Music2 className="h-4 w-4 text-zinc-600" />
-        )}
-        {active && (
-          <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-            <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse shadow-[0_0_8px_rgba(255,255,255,0.8)]" />
-          </div>
-        )}
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className={`text-sm truncate ${active ? "text-white font-medium" : "text-zinc-200"}`}>
-          {song.title}
-        </div>
-        <div className="text-xs text-zinc-500 truncate flex items-center gap-1.5">
-          <span className="truncate">{song.artist}</span>
-          <span className="text-zinc-700 hidden sm:inline">.</span>
-          <span className="text-zinc-600 font-mono tabular-nums hidden sm:inline">{fmt(song.duration)}</span>
-          {song.addedBy && (
-            <>
-              <span className="text-zinc-700 hidden md:inline">.</span>
-              <span
-                className="hidden md:inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-white/[0.04] border border-zinc-800 text-[10px] text-zinc-400 shrink-0"
-                title={`Added by ${song.addedBy}`}
-              >
-                <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: avatarColor(song.addedBy) }} />
-                <span>{song.addedBy}</span>
-              </span>
-            </>
-          )}
-        </div>
-      </div>
-      <Button
-        size="icon"
-        variant="ghost"
-        onClick={(e) => {
-          e.stopPropagation();
-          onAction?.();
-        }}
-        className="absolute right-2 top-1/2 -translate-y-1/2 h-7 w-7 flex-none shrink-0 opacity-100 transition-opacity text-zinc-400 hover:text-white hover:bg-white/10 rounded-full"
-      >
-        {action === "add" ? <Plus className="h-3.5 w-3.5" /> : <X className="h-3.5 w-3.5" />}
-      </Button>
     </div>
   );
 }
@@ -1160,19 +1263,15 @@ function EmptyIllustration({
 }
 
 function JoinScreen({
-  code,
-  setCode,
   username,
   setUsername,
   onJoin,
 }: {
-  code: string;
-  setCode: (v: string) => void;
   username: string;
   setUsername: (v: string) => void;
   onJoin: () => void;
 }) {
-  const canJoin = username.trim().length > 0 && code.trim().length > 0;
+  const canJoin = username.trim().length > 0;
   const initial = (username.trim()[0] || "?").toUpperCase();
   return (
     <div className="min-h-dvh w-full bg-black text-white flex items-center justify-center p-6 relative overflow-hidden">
@@ -1196,7 +1295,7 @@ function JoinScreen({
           </div>
 
           <h1 className="text-3xl font-semibold tracking-tight text-center">Obsidian Radio</h1>
-          <p className="text-sm text-zinc-500 text-center mt-2">Listen together. Perfectly in sync.</p>
+          <p className="text-sm text-zinc-500 text-center mt-2">One live room. Everyone joins the same stream.</p>
 
           <form
             onSubmit={(e) => {
@@ -1216,23 +1315,12 @@ function JoinScreen({
               />
             </div>
 
-            <div className="space-y-2">
-              <label className="text-[10px] uppercase tracking-[0.25em] text-zinc-500">Room Code</label>
-              <Input
-                value={code}
-                onChange={(e) => setCode(e.target.value.toUpperCase())}
-                placeholder="X7A9"
-                maxLength={6}
-                className="h-12 bg-black border-zinc-800 text-center font-mono text-lg tracking-[0.4em] placeholder:text-zinc-700 focus-visible:ring-1 focus-visible:ring-white/30 focus-visible:border-zinc-700"
-              />
-            </div>
-
             <Button
               type="submit"
               disabled={!canJoin}
               className="w-full h-12 bg-white text-black hover:bg-zinc-200 font-medium shadow-[0_0_40px_rgba(255,255,255,0.15)] disabled:opacity-40 disabled:shadow-none"
             >
-              Join Room
+              Join Live Room
             </Button>
           </form>
 
