@@ -132,17 +132,18 @@ export function YouTubePlayer({
 
     if (currentVideoIdRef.current !== videoId) {
       currentVideoIdRef.current = videoId;
+      const startTime = seekCommand?.time || 0;
       try {
         if (playing) {
-          playerRef.current.loadVideoById(videoId, 0);
+          playerRef.current.loadVideoById(videoId, startTime);
         } else {
-          playerRef.current.cueVideoById(videoId, 0);
+          playerRef.current.cueVideoById(videoId, startTime);
         }
       } catch (err) {
         console.error("Error loading video:", err);
       }
     }
-  }, [videoId, isPlayerReady, playing]);
+  }, [videoId, isPlayerReady, playing, seekCommand]);
 
   // Handle play/pause changes
   useEffect(() => {
@@ -209,8 +210,18 @@ export function YouTubePlayer({
     return () => clearInterval(interval);
   }, [isPlayerReady, playing, onStateChange]);
 
+  const handleManualPlay = () => {
+    try {
+      playerRef.current?.unMute?.();
+      playerRef.current?.playVideo?.();
+      onPlay();
+    } catch (e) {
+      console.error("Manual play error:", e);
+    }
+  };
+
   return (
-    <div className="w-full aspect-video max-h-[50vh] sm:max-h-[380px] lg:max-h-none rounded-xl overflow-hidden bg-zinc-950 relative border border-zinc-900/80 shadow-2xl">
+    <div className="w-full aspect-video max-h-[50vh] sm:max-h-[380px] lg:max-h-none rounded-xl overflow-hidden bg-zinc-950 relative border border-zinc-900/80 shadow-2xl group">
       <div ref={containerRef} className="w-full h-full object-cover" />
       {(!isPlayerReady || !videoId) && (
         <div className="absolute inset-0 flex items-center justify-center bg-zinc-950/95 z-10 backdrop-blur-sm">

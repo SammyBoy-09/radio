@@ -27,6 +27,7 @@ import {
   Crown,
   Sun,
   SunMedium,
+  LogOut,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -84,6 +85,11 @@ function getOrCreateSessionId(): string {
   return next;
 }
 
+function getStoredUsername(): string {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem("obsidian-radio-username") || "";
+}
+
 function avatarColor(name: string): string {
   const palette = ["#f5f5f5", "#a1a1aa", "#71717a", "#fafafa", "#d4d4d8", "#e4e4e7"];
   let h = 0;
@@ -99,9 +105,18 @@ function fmt(sec: number): string {
 }
 
 export default function Home() {
-  const [joined, setJoined] = useState(false);
   const [username, setUsername] = useState("");
+  const [joined, setJoined] = useState(false);
   const [sessionId] = useState(() => (typeof window === "undefined" ? "" : getOrCreateSessionId()));
+
+  // Auto-restore stored user on mount to prevent getting kicked out on refresh
+  useEffect(() => {
+    const savedName = getStoredUsername();
+    if (savedName) {
+      setUsername(savedName);
+      setJoined(true);
+    }
+  }, []);
 
   // Playback & Queue State
   const [playing, setPlaying] = useState(false);
@@ -465,6 +480,12 @@ export default function Home() {
         });
       });
       setListeners(list);
+
+      // Immediately request current room state from any active peer
+      channel.trigger("client-request-sync", {
+        requesterSessionId: sessionId,
+        requesterName: username,
+      });
     });
 
     channel.bind("pusher:member_added", (payload: unknown) => {
@@ -473,6 +494,19 @@ export default function Home() {
         if (curr.some((e) => e.id === member.id)) return curr;
         return [...curr, { id: member.id, name: member.info?.name || "Guest" }];
       });
+
+      // If we already have songs in our queue, proactively broadcast full state to the newcomer
+      if (queueRef.current.length > 0) {
+        channel.trigger("client-full-sync", {
+          queue: queueRef.current,
+          activeId: activeIdRef.current,
+          playing: playingRef.current,
+          progress: progressRef.current,
+          lastSyncTime: Date.now(),
+          repeatMode: repeatModeRef.current,
+          shuffle: shuffleRef.current,
+        });
+      }
     });
 
     channel.bind("pusher:member_removed", (payload: unknown) => {
@@ -483,6 +517,65 @@ export default function Home() {
         next.delete(member.info?.name || "");
         return next;
       });
+    });
+
+    // Handle incoming request for full state synchronization from a newly joined peer
+    channel.bind("client-request-sync", (payload: unknown) => {
+      const data = payload as { requesterSessionId?: string; requesterName?: string };
+      if (data.requesterSessionId === sessionIdRef.current) return;
+
+      if (queueRef.current.length > 0) {
+        channel.trigger("client-full-sync", {
+          queue: queueRef.current,
+          activeId: activeIdRef.current,
+          playing: playingRef.current,
+          progress: progressRef.current,
+          lastSyncTime: Date.now(),
+          repeatMode: repeatModeRef.current,
+          shuffle: shuffleRef.current,
+          targetSessionId: data.requesterSessionId,
+        });
+      }
+    });
+
+    // Handle full state synchronization packet
+    channel.bind("client-full-sync", (payload: unknown) => {
+      const data = payload as {
+        queue?: Song[];
+        activeId?: string;
+        playing?: boolean;
+        progress?: number;
+        lastSyncTime?: number;
+        repeatMode?: "off" | "all" | "one";
+        shuffle?: boolean;
+        targetSessionId?: string;
+      };
+
+      // If targeted to a specific session and not us, ignore
+      if (data.targetSessionId && data.targetSessionId !== sessionIdRef.current) return;
+
+      if (data.queue && data.queue.length > 0) {
+        // Adopt the authoritative room queue
+        if (!isHostRef.current || queueRef.current.length === 0) {
+          setQueue(data.queue);
+          const nextActiveId = data.activeId || data.queue[0]?.id || "";
+          setActiveId(nextActiveId);
+
+          const isPlaying = typeof data.playing === "boolean" ? data.playing : true;
+          setPlaying(isPlaying);
+
+          const elapsed =
+            isPlaying && data.lastSyncTime
+              ? Math.max(0, (Date.now() - data.lastSyncTime) / 1000)
+              : 0;
+          const targetTime = Math.max(0, (data.progress || 0) + elapsed);
+          setProgress(Math.floor(targetTime));
+          setSeekCommand({ time: targetTime, nonce: Date.now() });
+
+          if (data.repeatMode) setRepeatMode(data.repeatMode);
+          if (typeof data.shuffle === "boolean") setShuffle(data.shuffle);
+        }
+      }
     });
 
     // Handle incoming player actions
@@ -825,6 +918,15 @@ export default function Home() {
     skipNext(true);
   }, [skipNext]);
 
+  // Leave room handler
+  const handleLeaveRoom = () => {
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem("obsidian-radio-username");
+    }
+    setJoined(false);
+    toast("Left live stream", { description: "You can tune in again anytime." });
+  };
+
   // Render Join Screen if not yet joined
   if (!joined) {
     return (
@@ -832,9 +934,14 @@ export default function Home() {
         username={username}
         setUsername={setUsername}
         onJoin={() => {
+          const trimmed = username.trim();
+          if (!trimmed) return;
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem("obsidian-radio-username", trimmed);
+          }
           setJoined(true);
           setTimeout(() => {
-            toast.success(`Welcome, ${username || "Guest"}`, {
+            toast.success(`Welcome, ${trimmed}`, {
               description: "You tuned in to Obsidian Live Radio",
             });
           }, 100);
@@ -919,6 +1026,13 @@ export default function Home() {
             <span className="text-xs text-zinc-300 font-medium hidden md:inline max-w-[120px] truncate">
               {username || "Guest"}
             </span>
+            <button
+              onClick={handleLeaveRoom}
+              title="Leave room / switch name"
+              className="h-7 w-7 rounded-lg flex items-center justify-center text-zinc-500 hover:text-zinc-200 hover:bg-white/10 transition ml-1"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+            </button>
           </div>
         </div>
       </header>
