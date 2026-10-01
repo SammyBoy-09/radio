@@ -1302,13 +1302,19 @@ function SongRow({
       <Button
         size="icon"
         variant="ghost"
+        aria-label={action === "add" ? "Add to queue" : "Remove from queue"}
+        title={action === "add" ? "Add to queue" : "Remove from queue"}
         onClick={(e) => {
           e.stopPropagation();
           onAction?.();
         }}
-        className="h-8 w-8 sm:h-9 sm:w-9 shrink-0 text-zinc-400 hover:text-white hover:bg-white/10 rounded-full active:scale-95 transition bg-white/5 sm:bg-transparent"
+        className={`h-8 w-8 shrink-0 rounded-full transition active:scale-95 border ${
+          action === "add"
+            ? "bg-white/10 hover:bg-white text-zinc-200 hover:text-black border-white/15 shadow-sm"
+            : "bg-white/5 hover:bg-red-500/20 text-zinc-400 hover:text-red-400 border-zinc-800"
+        }`}
       >
-        {action === "add" ? <Plus className="h-4 w-4 text-white" /> : <X className="h-4 w-4 text-zinc-400" />}
+        {action === "add" ? <Plus className="h-4 w-4" /> : <X className="h-4 w-4" />}
       </Button>
     </div>
   );
