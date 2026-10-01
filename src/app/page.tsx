@@ -1240,7 +1240,7 @@ function SongRow({
       onDragStart={onDragStart}
       onDragOver={onDragOver}
       onDragEnd={onDragEnd}
-      className={`group relative flex items-center gap-2.5 sm:gap-3 p-2.5 sm:p-2 pr-12 sm:pr-14 w-full min-w-0 overflow-hidden rounded-xl cursor-pointer transition-all border ${
+      className={`group flex items-center gap-2.5 sm:gap-3 p-2 sm:p-2.5 w-full min-w-0 rounded-xl cursor-pointer transition-all border ${
         active
           ? "bg-white/5 border-zinc-800 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)]"
           : "border-transparent hover:bg-white/3 hover:border-zinc-900"
@@ -1269,7 +1269,7 @@ function SongRow({
         )}
       </div>
 
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1 pr-1">
         <div
           className={`text-xs sm:text-sm truncate font-medium ${
             active ? "text-white" : "text-zinc-200"
@@ -1306,9 +1306,9 @@ function SongRow({
           e.stopPropagation();
           onAction?.();
         }}
-        className="absolute right-2 top-1/2 -translate-y-1/2 h-8 w-8 flex-none shrink-0 text-zinc-400 hover:text-white hover:bg-white/10 rounded-full active:scale-95"
+        className="h-8 w-8 sm:h-9 sm:w-9 shrink-0 text-zinc-400 hover:text-white hover:bg-white/10 rounded-full active:scale-95 transition bg-white/5 sm:bg-transparent"
       >
-        {action === "add" ? <Plus className="h-4 w-4" /> : <X className="h-4 w-4" />}
+        {action === "add" ? <Plus className="h-4 w-4 text-white" /> : <X className="h-4 w-4 text-zinc-400" />}
       </Button>
     </div>
   );
