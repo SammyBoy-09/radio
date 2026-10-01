@@ -1354,7 +1354,7 @@ function SongRow({
       onDragStart={onDragStart}
       onDragOver={onDragOver}
       onDragEnd={onDragEnd}
-      className={`group flex items-center gap-2.5 sm:gap-3 p-2 sm:p-2.5 w-full min-w-0 rounded-xl cursor-pointer transition-all border ${
+      className={`group flex items-center gap-2.5 sm:gap-3 p-2 sm:p-2.5 w-full max-w-full min-w-0 rounded-xl cursor-pointer transition-all border ${
         active
           ? "bg-white/5 border-zinc-800 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)]"
           : "border-transparent hover:bg-white/3 hover:border-zinc-900"
@@ -1383,7 +1383,7 @@ function SongRow({
         )}
       </div>
 
-      <div className="min-w-0 flex-1 pr-1">
+      <div className="min-w-0 flex-1 overflow-hidden pr-1">
         <div
           className={`text-xs sm:text-sm truncate font-medium ${
             active ? "text-white" : "text-zinc-200"
@@ -1394,7 +1394,7 @@ function SongRow({
         <div className="text-[11px] text-zinc-500 truncate flex items-center gap-1.5 mt-0.5">
           <span className="truncate">{song.artist}</span>
           <span className="text-zinc-700">.</span>
-          <span className="text-zinc-500 font-mono tabular-nums">{fmt(song.duration)}</span>
+          <span className="text-zinc-500 font-mono tabular-nums shrink-0">{fmt(song.duration)}</span>
           {song.addedBy && (
             <>
               <span className="text-zinc-700 hidden sm:inline">.</span>
@@ -1413,23 +1413,22 @@ function SongRow({
         </div>
       </div>
 
-      <Button
-        size="icon"
-        variant="ghost"
+      <button
+        type="button"
         aria-label={action === "add" ? "Add to queue" : "Remove from queue"}
         title={action === "add" ? "Add to queue" : "Remove from queue"}
         onClick={(e) => {
           e.stopPropagation();
           onAction?.();
         }}
-        className={`h-8 w-8 shrink-0 rounded-full transition active:scale-95 border ${
+        className={`h-8 w-8 shrink-0 flex items-center justify-center rounded-full transition-all active:scale-95 border ${
           action === "add"
-            ? "bg-white/10 hover:bg-white text-zinc-200 hover:text-black border-white/15 shadow-sm"
+            ? "bg-white/10 hover:bg-white text-zinc-200 hover:text-black border-white/20 shadow-sm"
             : "bg-white/5 hover:bg-red-500/20 text-zinc-400 hover:text-red-400 border-zinc-800"
         }`}
       >
         {action === "add" ? <Plus className="h-4 w-4" /> : <X className="h-4 w-4" />}
-      </Button>
+      </button>
     </div>
   );
 }

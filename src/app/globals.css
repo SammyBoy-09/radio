@@ -97,4 +97,10 @@
     border-color: var(--color-border);
     box-sizing: border-box;
   }
+
+  [data-radix-scroll-area-viewport] > div {
+    display: block !important;
+    width: 100% !important;
+    min-width: 0 !important;
+  }
 }
