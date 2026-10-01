@@ -1,18 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-
-type Song = {
-  id: string;
-  title: string;
-  artist: string;
-  duration: number;
-  thumbnail: string;
-};
+import { getCachedSearch, setCachedSearch, Song } from "@/lib/redis";
 
 function parseIsoDuration(duration: string): number {
-  const match = duration.match(
-    /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/,
-  );
-
+  const match = duration.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
   if (!match) return 0;
 
   const hours = Number(match[1] || 0);
@@ -27,12 +17,27 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { query } = body as { query: string };
 
-    if (!query || typeof query !== "string") {
+    if (!query || typeof query !== "string" || !query.trim()) {
       return NextResponse.json({ error: "Invalid query" }, { status: 400 });
     }
 
-    const apiKey = process.env.YOUTUBE_API_KEY;
+    const trimmedQuery = query.trim();
 
+    // 1. Check Redis Cache first (saves YouTube API quota)
+    const cached = await getCachedSearch(trimmedQuery);
+    if (cached && Array.isArray(cached)) {
+      return NextResponse.json(
+        {
+          results: cached,
+          query: trimmedQuery,
+          count: cached.length,
+          cached: true,
+        },
+        { status: 200 },
+      );
+    }
+
+    const apiKey = process.env.YOUTUBE_API_KEY;
     if (!apiKey) {
       return NextResponse.json(
         { error: "YOUTUBE_API_KEY is not configured" },
@@ -40,8 +45,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // 2. Fetch from YouTube Data API v3
     const searchResponse = await fetch(
-      `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=12&q=${encodeURIComponent(query)}&key=${apiKey}`,
+      `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=12&q=${encodeURIComponent(
+        trimmedQuery,
+      )}&key=${apiKey}`,
       { cache: "no-store" },
     );
 
@@ -74,11 +82,13 @@ export async function POST(request: NextRequest) {
       .filter((value): value is string => Boolean(value));
 
     if (!videoIds.length) {
-      return NextResponse.json({ results: [], query, count: 0 }, { status: 200 });
+      return NextResponse.json({ results: [], query: trimmedQuery, count: 0 }, { status: 200 });
     }
 
     const detailsResponse = await fetch(
-      `https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=${videoIds.join(",")}&key=${apiKey}`,
+      `https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=${videoIds.join(
+        ",",
+      )}&key=${apiKey}`,
       { cache: "no-store" },
     );
 
@@ -107,7 +117,7 @@ export async function POST(request: NextRequest) {
       ]),
     );
 
-    const results = (searchData.items || [])
+    const results: Song[] = (searchData.items || [])
       .map((item) => {
         const id = item.id?.videoId || "";
         const title = item.snippet?.title?.trim() || "Untitled video";
@@ -124,15 +134,21 @@ export async function POST(request: NextRequest) {
           artist,
           duration: durationById.get(id) || 0,
           thumbnail,
-        } satisfies Song;
+        };
       })
       .filter((song) => song.id);
+
+    // 3. Save to Redis Cache (24-hour TTL)
+    if (results.length > 0) {
+      await setCachedSearch(trimmedQuery, results);
+    }
 
     return NextResponse.json(
       {
         results,
-        query,
+        query: trimmedQuery,
         count: results.length,
+        cached: false,
       },
       { status: 200 },
     );

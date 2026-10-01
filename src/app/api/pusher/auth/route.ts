@@ -1,16 +1,36 @@
 import Pusher from "pusher";
 import { NextRequest, NextResponse } from "next/server";
 
-const pusher = new Pusher({
-  appId: process.env.PUSHER_APP_ID || "",
-  key: process.env.PUSHER_APP_KEY || "",
-  secret: process.env.PUSHER_APP_SECRET || "",
-  cluster: process.env.PUSHER_APP_CLUSTER || "",
-  useTLS: true,
-});
+function getPusherServer() {
+  const appId = process.env.PUSHER_APP_ID;
+  const key = process.env.PUSHER_APP_KEY;
+  const secret = process.env.PUSHER_APP_SECRET;
+  const cluster = process.env.PUSHER_APP_CLUSTER;
+
+  if (!appId || !key || !secret || !cluster) {
+    return null;
+  }
+
+  return new Pusher({
+    appId,
+    key,
+    secret,
+    cluster,
+    useTLS: true,
+  });
+}
 
 export async function POST(request: NextRequest) {
   try {
+    const pusher = getPusherServer();
+    if (!pusher) {
+      console.warn("Pusher server credentials missing from environment variables.");
+      return NextResponse.json(
+        { error: "Pusher credentials not configured on server" },
+        { status: 503 },
+      );
+    }
+
     const contentType = request.headers.get("content-type") || "";
     let socketId = "";
     let channelName = "";
@@ -48,11 +68,12 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Invalid channel" }, { status: 403 });
     }
 
+    const safeUserId = sessionId || `session-${socketId.slice(0, 8)}`;
     const auth = pusher.authorizeChannel(socketId, channelName, {
-      user_id: sessionId || `session-${socketId.slice(0, 8)}`,
+      user_id: safeUserId,
       user_info: {
         name: username || "Guest",
-        sessionId: sessionId || `session-${socketId.slice(0, 8)}`,
+        sessionId: safeUserId,
       },
     });
 
