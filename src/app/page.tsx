@@ -138,6 +138,7 @@ export default function Home() {
 
   // Presence & Voting
   const [listeners, setListeners] = useState<Array<{ id: string; name: string }>>([]);
+  const [showListenersModal, setShowListenersModal] = useState(false);
   const [skipVotes, setSkipVotes] = useState<Set<string>>(new Set());
   const [dragId, setDragId] = useState<string | null>(null);
 
@@ -1003,15 +1004,22 @@ export default function Home() {
         </div>
 
         <div className="flex items-center gap-2 sm:gap-3">
-          <Badge
-            variant="outline"
-            className="border-zinc-800 bg-zinc-900/80 text-zinc-300 gap-1.5 font-normal text-xs px-2.5 py-1"
+          <button
+            type="button"
+            onClick={() => setShowListenersModal(true)}
+            title="View all active listeners in room"
+            className="rounded-full focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 cursor-pointer active:scale-95 transition"
           >
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse sm:hidden" />
-            <Users className="h-3 w-3" />
-            <span>{totalListeners}</span>
-            <span className="hidden sm:inline">{totalListeners === 1 ? "listener" : "listeners"}</span>
-          </Badge>
+            <Badge
+              variant="outline"
+              className="border-zinc-800 bg-zinc-900/80 hover:bg-zinc-800 hover:border-zinc-700 text-zinc-300 hover:text-white gap-1.5 font-normal text-xs px-2.5 py-1 transition cursor-pointer"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse sm:hidden" />
+              <Users className="h-3 w-3" />
+              <span>{totalListeners}</span>
+              <span className="hidden sm:inline">{totalListeners === 1 ? "listener" : "listeners"}</span>
+            </Badge>
+          </button>
 
           <div className="flex items-center gap-1.5 sm:gap-2 sm:pl-3 sm:border-l border-zinc-800">
             <div
@@ -1319,6 +1327,15 @@ export default function Home() {
           </div>
         </section>
       </div>
+
+      {/* View Listeners Modal */}
+      <ListenersModal
+        isOpen={showListenersModal}
+        onClose={() => setShowListenersModal(false)}
+        listeners={listeners}
+        currentSessionId={sessionId}
+        currentUsername={username}
+      />
     </div>
   );
 }
@@ -1771,6 +1788,132 @@ function JoinScreen({
               Tune In To Live Broadcast
             </Button>
           </form>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ListenersModal({
+  isOpen,
+  onClose,
+  listeners,
+  currentSessionId,
+  currentUsername,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  listeners: Array<{ id: string; name: string }>;
+  currentSessionId: string;
+  currentUsername: string;
+}) {
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    if (isOpen) {
+      window.addEventListener("keydown", handleKeyDown);
+    }
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isOpen, onClose]);
+
+  if (!isOpen) return null;
+
+  // Include current user if listeners list hasn't populated yet
+  const displayListeners =
+    listeners.length > 0
+      ? listeners
+      : [{ id: currentSessionId, name: currentUsername || "You" }];
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      {/* Backdrop */}
+      <div
+        onClick={onClose}
+        className="fixed inset-0 bg-black/80 backdrop-blur-sm transition-opacity animate-in fade-in"
+      />
+
+      {/* Modal Box */}
+      <div className="relative w-full max-w-sm sm:max-w-md rounded-2xl border border-zinc-800 bg-zinc-950 p-4 sm:p-5 shadow-2xl z-10 animate-in zoom-in-95 duration-150">
+        <div className="flex items-center justify-between pb-3.5 border-b border-zinc-900">
+          <div className="flex items-center gap-2.5">
+            <div className="h-8 w-8 rounded-lg bg-white/5 border border-zinc-800 flex items-center justify-center">
+              <Users className="h-4 w-4 text-white" />
+            </div>
+            <div>
+              <h2 className="text-sm font-semibold text-white">Live Listeners</h2>
+              <p className="text-[11px] text-zinc-500">
+                {displayListeners.length} {displayListeners.length === 1 ? "person" : "people"} connected now
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="h-8 w-8 rounded-lg flex items-center justify-center text-zinc-500 hover:text-white hover:bg-white/10 transition"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="mt-3 max-h-[50vh] overflow-y-auto space-y-1.5 pr-1">
+          {displayListeners.map((l, idx) => {
+            const isMe = l.id === currentSessionId || (displayListeners.length === 1 && l.name === currentUsername);
+            const isHost = idx === 0;
+
+            return (
+              <div
+                key={l.id || idx}
+                className="flex items-center justify-between p-2.5 rounded-xl bg-white/3 border border-zinc-900/80 hover:border-zinc-800 transition"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div
+                    className="h-8 w-8 sm:h-9 sm:w-9 rounded-full flex items-center justify-center text-xs font-semibold text-black relative shrink-0 shadow"
+                    style={{ backgroundColor: avatarColor(l.name) }}
+                  >
+                    {(l.name[0] || "?").toUpperCase()}
+                    {isHost && (
+                      <Crown className="h-3 w-3 text-amber-400 absolute -top-1 -right-1 drop-shadow" />
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs sm:text-sm font-medium text-zinc-200 truncate max-w-[160px] sm:max-w-[200px]">
+                        {l.name}
+                      </span>
+                      {isMe && (
+                        <span className="text-[9px] sm:text-[10px] px-1.5 py-0.2 rounded bg-white/10 border border-white/10 text-zinc-300 font-mono">
+                          You
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-zinc-500 flex items-center gap-1.5 mt-0.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                      <span>{isHost ? "Room Host" : "Listener"}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="text-[11px] text-zinc-600 font-mono">
+                  {isHost ? "Host" : "Online"}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="mt-4 pt-3 border-t border-zinc-900 flex justify-between items-center text-[11px] text-zinc-500">
+          <span className="flex items-center gap-1.5">
+            <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+            Live sync active
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onClose}
+            className="h-8 px-3 text-xs border-zinc-800 bg-zinc-900 text-zinc-300 hover:text-white hover:bg-zinc-800"
+          >
+            Close
+          </Button>
         </div>
       </div>
     </div>
